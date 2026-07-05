@@ -8,6 +8,7 @@ import {
   newId,
 } from "./db";
 import { parseEdgeTxLog } from "./edgetx";
+import { parseBlackboxCsv, isBlackboxHeader } from "./blackbox";
 
 const emptyEntry = {
   date: "",
@@ -47,6 +48,7 @@ export default function DroneFlightLog() {
   const [selected, setSelected] = useState(null);
   const [notice, setNotice] = useState(null); // { text, tone: "ok" | "warn" }
   const [totalHours, setTotalHours] = useState(0);
+  const [fixDate, setFixDate] = useState("");
   const noticeTimer = useRef(null);
   const restoreInputRef = useRef(null);
   const radioInputRef = useRef(null);
@@ -104,6 +106,16 @@ export default function DroneFlightLog() {
     setView("log");
   }
 
+  async function saveFlightDate() {
+    if (!fixDate || !selected) return;
+    const updated = { ...selected, date: fixDate };
+    await putEntry(updated);
+    setEntries(await getAllEntries());
+    setSelected(updated);
+    setFixDate("");
+    showNotice("✓ Flight date saved");
+  }
+
   function handleExport() {
     const payload = { app: "drone-flight-logbook", exportedAt: new Date().toISOString(), entries };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -139,14 +151,21 @@ export default function DroneFlightLog() {
     if (files.length === 0) return;
     const drafts = [];
     for (const file of files) {
+      if (/\.gps\.csv$/i.test(file.name)) continue; // side output of blackbox_decode
       try {
-        drafts.push(...parseEdgeTxLog(file.name, await file.text()));
+        const headerLine = (await file.slice(0, 8192).text()).split("\n")[0];
+        if (isBlackboxHeader(headerLine)) {
+          const entry = await parseBlackboxCsv(file);
+          if (entry) drafts.push(entry);
+        } else {
+          drafts.push(...parseEdgeTxLog(file.name, await file.text()));
+        }
       } catch {
         // unreadable file — reported below if nothing parses
       }
     }
     if (drafts.length === 0) {
-      showNotice("No flights found — expected EdgeTX telemetry CSV logs", "warn");
+      showNotice("No flights found — expected EdgeTX telemetry or decoded blackbox CSVs", "warn");
       return;
     }
     const { added, skipped } = await mergeEntries(
@@ -247,7 +266,7 @@ export default function DroneFlightLog() {
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {entries.map(e => (
-                <div key={e.id} onClick={() => { setSelected(e); setView("detail"); }}
+                <div key={e.id} onClick={() => { setSelected(e); setFixDate(""); setView("detail"); }}
                   style={{ background: "#111", border: "1px solid #1e1e1e", borderLeft: "3px solid #c8a84b", padding: "12px 14px", cursor: "pointer", borderRadius: 2 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                     <div>
@@ -260,6 +279,7 @@ export default function DroneFlightLog() {
                     </div>
                   </div>
                   {e.incidents && <div style={{ marginTop: 6, fontSize: 10, color: "#e55", background: "#200", padding: "3px 6px" }}>⚠ {e.incidents}</div>}
+                  {!e.date && <div style={{ marginTop: 6, fontSize: 10, color: "#ff9800", background: "#2a1a00", padding: "3px 6px" }}>📅 DATE NEEDED — open this entry to set it</div>}
                 </div>
               ))}
             </div>
@@ -275,7 +295,26 @@ export default function DroneFlightLog() {
           </button>
           <div style={{ background: "#111", border: "1px solid #222", padding: 16, borderRadius: 2 }}>
             <div style={{ fontSize: 16, color: "#fff", fontWeight: "bold", marginBottom: 4 }}>{selected.location}</div>
-            <div style={{ fontSize: 10, color: "#c8a84b", letterSpacing: 2, marginBottom: 16 }}>{selected.date}</div>
+            <div style={{ fontSize: 10, color: "#c8a84b", letterSpacing: 2, marginBottom: 16 }}>{selected.date || "— DATE NOT SET —"}</div>
+            {!selected.date && (
+              <div style={{ background: "#2a1a00", border: "1px solid #ff980055", padding: 12, marginBottom: 16 }}>
+                <div style={{ fontSize: 10, color: "#ff9800", letterSpacing: 1, marginBottom: 8 }}>
+                  📅 FLIGHT DATE NEEDED — blackbox logs don't record the calendar date
+                </div>
+                <input type="date" value={fixDate} onChange={e => setFixDate(e.target.value)} style={{
+                  width: "100%", background: "#0a0a0a", border: "1px solid #1e1e1e", borderRadius: 2,
+                  color: "#e8e0d0", padding: "8px 10px", fontSize: 12, fontFamily: "'Courier New', monospace",
+                  boxSizing: "border-box"
+                }} />
+                <button onClick={saveFlightDate} disabled={!fixDate} style={{
+                  marginTop: 8, width: "100%", padding: "10px", background: fixDate ? "#c8a84b" : "#333",
+                  border: "none", color: fixDate ? "#000" : "#666", fontWeight: "bold", fontSize: 11,
+                  letterSpacing: 2, cursor: fixDate ? "pointer" : "default"
+                }}>
+                  SAVE DATE
+                </button>
+              </div>
+            )}
             {[
               ["Pilot", selected.pilotName], ["Flyer ID", selected.flierID], ["Operator ID", selected.operatorID],
               ["Aircraft", selected.craftName], ["Type", selected.craftType], ["Serial No.", selected.serialNumber],
@@ -375,15 +414,18 @@ export default function DroneFlightLog() {
               onChange={handleRestore} style={{ display: "none" }} />
           </Section>
 
-          <Section title="Import from Radio">
-            <DataButton onClick={() => radioInputRef.current?.click()} label="📻 Import from Radio"
-              hint="Select EdgeTX telemetry CSV logs from your radio's SD card (LOGS folder)" />
+          <Section title="Import Flights">
+            <DataButton onClick={() => radioInputRef.current?.click()} label="📻 Import Radio / Blackbox Logs"
+              hint="EdgeTX telemetry CSVs (radio SD card, LOGS folder) or decoded Betaflight blackbox CSVs — format is detected automatically" />
             <input ref={radioInputRef} type="file" accept=".csv,text/csv" multiple
               onChange={handleRadioImport} style={{ display: "none" }} />
             <div style={{ fontSize: 10, color: "#555", marginTop: 8, lineHeight: 1.6 }}>
-              Each log is split into flights automatically (gaps over 90 seconds start a new flight).
-              Date, takeoff/landing times, duration, max altitude, GPS coordinates and battery usage
-              are filled in from telemetry. Re-importing the same log won't create duplicates.
+              EdgeTX logs are split into flights automatically (gaps over 90 seconds start a new
+              flight) with date, times, duration, altitude, GPS and battery filled in.
+              Betaflight blackbox logs (.bbl / .bfl) must first be converted to CSV with
+              `npm run decode-blackbox` — those entries import with duration, max altitude,
+              min voltage and GPS, but need the flight date set manually.
+              Re-importing the same log won't create duplicates.
             </div>
           </Section>
 

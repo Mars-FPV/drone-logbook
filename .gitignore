@@ -13,6 +13,10 @@ dist-ssr
 dev-dist
 *.local
 
+# blackbox decoding: downloaded binaries and personal flight logs
+tools/
+blackbox-logs/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
